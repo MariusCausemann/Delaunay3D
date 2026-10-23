@@ -118,6 +118,10 @@ else()
 	endif()
 endif()
 
+# tetrahedrize() can sort the vertices on several threads (see setNumThreads)
+find_package(Threads REQUIRED)
+target_link_libraries(${PROJECT_NAME} PUBLIC Threads::Threads)
+
 # Public include directory
 target_include_directories(${PROJECT_NAME} PUBLIC
 	include
@@ -133,6 +137,7 @@ if(DELAUNAY3D_BUILD_TESTS)
 	enable_testing()
 	add_executable(delaunay3d_test test/nondelaunay_edge_insertion.cpp)
 	target_compile_features(delaunay3d_test PUBLIC cxx_std_20)
+	target_link_libraries(delaunay3d_test PUBLIC Threads::Threads)
 	target_include_directories(delaunay3d_test PUBLIC
 		include
 		${nfg_SOURCE_DIR}/include

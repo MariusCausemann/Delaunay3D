@@ -7,6 +7,8 @@
 #include <fstream>
 #include <vector>
 #include <iomanip>
+#include <algorithm>
+#include <thread>
 
 namespace Del3D {
 
@@ -226,6 +228,8 @@ public:
 
   const bool has_outer_vertices; // This is TRUE if mesh vertices must survive after destruction
 
+  unsigned num_threads = 1; // Threads for the parallel parts of tetrahedrize() (see setNumThreads)
+
   double max_coord_x, max_coord_y, max_coord_z, max_coord;
   double o3d_static_filter; // Static filter for orient3d
   double isp_static_filter; // Static filter for insphere
@@ -266,6 +270,10 @@ public:
   // Init the mesh with a tet connecting four non coplanar points in vertices
   // Return false if no tetrahedron is created (e.g. if all points are coplanar)
   bool init(uint32_t& unswap_k, uint32_t& unswap_l);
+
+  // Number of threads tetrahedrize() may use to order the vertices before inserting them.
+  // The insertion itself is serial. The result does not depend on this number.
+  void setNumThreads(unsigned n) { num_threads = n ? n : 1; }
 
   // Create a Delaunay tetrahedrization by incremental insertion
   void tetrahedrize();
@@ -472,6 +480,13 @@ public:
       if constexpr (std::is_pointer_v<pointType>) 
           return -std::remove_pointer_t<pointType>::orient3D(*vertices[v1], *vertices[v2], *vertices[v3], *vertices[v4]);
       else return -pointType::orient3D(vertices[v1], vertices[v2], vertices[v3], vertices[v4]);
+  }
+
+  // TRUE if the three vertices are not collinear
+  bool vMisaligned(uint32_t v1, uint32_t v2, uint32_t v3) const {
+      if constexpr (std::is_pointer_v<pointType>)
+          return std::remove_pointer_t<pointType>::misaligned(*vertices[v1], *vertices[v2], *vertices[v3]);
+      else return pointType::misaligned(vertices[v1], vertices[v2], vertices[v3]);
   }
 
   // Same as vOrient3D, with a point that is not a vertex of the mesh as fourth argument
@@ -810,9 +825,15 @@ template<class pointType> bool TetMesh_t<pointType>::init(uint32_t& unswap_k, ui
   int ori=0;
   uint32_t i=0, j=1, k=2, l=3;
 
-  for (; ori == 0 && k < n - 1; k++)
+  for (; ori == 0 && k < n - 1; k++) {
+      // Every l is coplanar with i, j and a k on their line, so scanning them for such a k
+      // finds nothing but costs n exact orient3d calls (no filter can decide a zero). Sorted
+      // voxel-like input puts many points on the line of vertices 0 and 1, which made this
+      // search quadratic. Skipping these k picks the same k and l as the full scan.
+      if (!vMisaligned(i, j, k)) continue;
       for (l = k + 1; ori == 0 && l < n; l++)
           ori = vOrient3D(i, j, k, l);
+  }
 
   l--; k--;
 
@@ -856,40 +877,94 @@ inline uint32_t mortonCode3D(uint32_t x, uint32_t y, uint32_t z) {
     return mc;
 }
 
+// Run fn(t) for t in [0, nt), on nt threads unless nt is 1
+template<class F> inline void runChunks(uint32_t nt, F&& fn) {
+    if (nt == 1) { fn(0); return; }
+    std::vector<std::thread> pool;
+    pool.reserve(nt);
+    for (uint32_t t = 0; t < nt; t++) pool.emplace_back(fn, t);
+    for (std::thread& th : pool) th.join();
+}
+
 template<class pointType> std::vector<std::pair<uint32_t, uint32_t>> TetMesh_t<pointType>::sortVerticesByMortonCode() const {
     const uint32_t n = numVertices();
 
-    double c_x, c_y, c_z, min_x, min_y, min_z, max_x, max_y, max_z;
-    getVertexCoordinates(0, min_x, min_y, min_z);
-    max_x = min_x; max_y = min_y; max_z = min_z;
-    for (uint32_t i = 1; i < n; ++i) {
-        getVertexCoordinates(i, c_x, c_y, c_z);
-        min_x = std::min(min_x, c_x);
-        min_y = std::min(min_y, c_y);
-        min_z = std::min(min_z, c_z);
-        max_x = std::max(max_x, c_x);
-        max_y = std::max(max_y, c_y);
-        max_z = std::max(max_z, c_z);
+    // One contiguous chunk of vertices per thread. Below 2^16 vertices per thread the threads
+    // cost more than they save. Min, max and the codes are exact, and the merged chunks are
+    // the same sorted sequence, so the result does not depend on the number of chunks.
+    const uint32_t nt = (uint32_t)std::max<uint64_t>(1, std::min<uint64_t>(num_threads, n >> 16));
+    auto chunk_begin = [&](uint32_t t) { return (uint32_t)((uint64_t)n * t / nt); };
+
+    std::vector<double> box(6 * nt);
+    runChunks(nt, [&](uint32_t t) {
+        double c_x, c_y, c_z, min_x, min_y, min_z, max_x, max_y, max_z;
+        const uint32_t b = chunk_begin(t), e = chunk_begin(t + 1);
+        getVertexCoordinates(b, min_x, min_y, min_z);
+        max_x = min_x; max_y = min_y; max_z = min_z;
+        for (uint32_t i = b + 1; i < e; ++i) {
+            getVertexCoordinates(i, c_x, c_y, c_z);
+            min_x = std::min(min_x, c_x);
+            min_y = std::min(min_y, c_y);
+            min_z = std::min(min_z, c_z);
+            max_x = std::max(max_x, c_x);
+            max_y = std::max(max_y, c_y);
+            max_z = std::max(max_z, c_z);
+        }
+        double* bt = box.data() + 6 * t;
+        bt[0] = min_x; bt[1] = min_y; bt[2] = min_z; bt[3] = max_x; bt[4] = max_y; bt[5] = max_z;
+    });
+    double min_x = box[0], min_y = box[1], min_z = box[2], max_x = box[3], max_y = box[4], max_z = box[5];
+    for (uint32_t t = 1; t < nt; t++) {
+        const double* bt = box.data() + 6 * t;
+        min_x = std::min(min_x, bt[0]);
+        min_y = std::min(min_y, bt[1]);
+        min_z = std::min(min_z, bt[2]);
+        max_x = std::max(max_x, bt[3]);
+        max_y = std::max(max_y, bt[4]);
+        max_z = std::max(max_z, bt[5]);
     }
 
     double range_x = 1023.0 / (max_x - min_x);
     double range_y = 1023.0 / (max_y - min_y);
     double range_z = 1023.0 / (max_z - min_z);
 
-    std::vector<std::pair<uint32_t, uint32_t>> morton_indices(n); // <code, index>
-    for (uint32_t i = 0; i < n; ++i) {
-        getVertexCoordinates(i, c_x, c_y, c_z);
-        uint32_t x = static_cast<uint32_t>((c_x - min_x) * range_x);
-        uint32_t y = static_cast<uint32_t>((c_y - min_y) * range_y);
-        uint32_t z = static_cast<uint32_t>((c_z - min_z) * range_z);
-        morton_indices[i] = { mortonCode3D(x, y, z), i };
-    }
-
     // Points in the same grid cell share a Morton code. Comparing the whole pair breaks such
     // ties by vertex index: std::sort is not stable, so ordering by the code alone would leave
     // their insertion order to the standard library, and the tetrahedra would come out in a
     // different order on each platform.
-    std::sort(morton_indices.begin(), morton_indices.end());
+    std::vector<std::pair<uint32_t, uint32_t>> morton_indices(n); // <code, index>
+    runChunks(nt, [&](uint32_t t) {
+        double c_x, c_y, c_z;
+        const uint32_t b = chunk_begin(t), e = chunk_begin(t + 1);
+        for (uint32_t i = b; i < e; ++i) {
+            getVertexCoordinates(i, c_x, c_y, c_z);
+            uint32_t x = static_cast<uint32_t>((c_x - min_x) * range_x);
+            uint32_t y = static_cast<uint32_t>((c_y - min_y) * range_y);
+            uint32_t z = static_cast<uint32_t>((c_z - min_z) * range_z);
+            morton_indices[i] = { mortonCode3D(x, y, z), i };
+        }
+        std::sort(morton_indices.begin() + b, morton_indices.begin() + e);
+    });
+
+    // Merge sorted runs pairwise until one is left, alternating between two buffers
+    if (nt > 1) {
+        std::vector<std::pair<uint32_t, uint32_t>> other(n);
+        std::vector<uint32_t> runs(nt + 1);
+        for (uint32_t t = 0; t <= nt; t++) runs[t] = chunk_begin(t);
+        while (runs.size() > 2) {
+            const uint32_t nruns = (uint32_t)runs.size() - 1, npairs = (nruns + 1) / 2;
+            runChunks(npairs, [&](uint32_t p) {
+                const uint32_t b = runs[2 * p], m = runs[std::min(2 * p + 1, nruns)], e = runs[std::min(2 * p + 2, nruns)];
+                std::merge(morton_indices.begin() + b, morton_indices.begin() + m,
+                           morton_indices.begin() + m, morton_indices.begin() + e, other.begin() + b);
+            });
+            std::vector<uint32_t> merged;
+            for (uint32_t r = 0; r < nruns; r += 2) merged.push_back(runs[r]);
+            merged.push_back(runs[nruns]);
+            runs.swap(merged);
+            morton_indices.swap(other);
+        }
+    }
 
 	return morton_indices;
 }
